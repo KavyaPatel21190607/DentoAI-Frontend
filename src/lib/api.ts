@@ -1,9 +1,22 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000/api/v1";
 
+const ACCESS_TOKEN_KEY = "dentoai_access_token";
+const REFRESH_TOKEN_KEY = "dentoai_refresh_token";
+
 type ApiEnvelope<T> = {
   success: boolean;
   data: T;
   error?: { code: string; message: string; details?: unknown };
+};
+
+type AuthTokens = {
+  accessToken: string;
+  refreshToken: string;
+};
+
+type AuthResponse = {
+  user: User;
+  tokens: AuthTokens;
 };
 
 export class ApiError extends Error {
@@ -28,21 +41,69 @@ function firstValidationMessage(details: unknown) {
   }
   return undefined;
 }
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+
+function storageAvailable() {
+  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
+}
+
+function getAccessToken() {
+  return storageAvailable() ? window.localStorage.getItem(ACCESS_TOKEN_KEY) : null;
+}
+
+function getRefreshToken() {
+  return storageAvailable() ? window.localStorage.getItem(REFRESH_TOKEN_KEY) : null;
+}
+
+function saveTokens(tokens?: AuthTokens) {
+  if (!tokens || !storageAvailable()) return;
+  window.localStorage.setItem(ACCESS_TOKEN_KEY, tokens.accessToken);
+  window.localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refreshToken);
+}
+
+function clearTokens() {
+  if (!storageAvailable()) return;
+  window.localStorage.removeItem(ACCESS_TOKEN_KEY);
+  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
+}
+
+async function request<T>(path: string, options: RequestInit = {}, retryOnUnauthorized = true): Promise<T> {
   const headers = new Headers(options.headers);
   const isFormData = options.body instanceof FormData;
+  const accessToken = getAccessToken();
 
   if (!isFormData && options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
+  if (accessToken && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+  }
+
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...options,
     headers,
-    credentials: "include"
+    credentials: "omit"
   });
 
   const payload = (await response.json().catch(() => null)) as ApiEnvelope<T> | null;
+
+  if (response.status === 401 && retryOnUnauthorized && path !== "/auth/refresh") {
+    const refreshToken = getRefreshToken();
+
+    if (refreshToken) {
+      try {
+        const refreshed = await request<AuthResponse>(
+          "/auth/refresh",
+          { method: "POST", body: JSON.stringify({ refreshToken }) },
+          false
+        );
+        saveTokens(refreshed.tokens);
+        return request<T>(path, options, false);
+      } catch {
+        clearTokens();
+      }
+    }
+  }
 
   if (!response.ok || !payload?.success) {
     throw new ApiError(
@@ -129,13 +190,26 @@ export type DoctorReport = {
 };
 
 export const api = {
-  login: (body: { email: string; password: string }) =>
-    request<{ user: User }>("/auth/login", { method: "POST", body: JSON.stringify(body) }),
+  login: async (body: { email: string; password: string }) => {
+    const data = await request<AuthResponse>("/auth/login", { method: "POST", body: JSON.stringify(body) }, false);
+    saveTokens(data.tokens);
+    return { user: data.user };
+  },
 
-  register: (body: unknown) =>
-    request<{ user: User }>("/auth/register", { method: "POST", body: JSON.stringify(body) }),
+  register: async (body: unknown) => {
+    const data = await request<AuthResponse>("/auth/register", { method: "POST", body: JSON.stringify(body) }, false);
+    saveTokens(data.tokens);
+    return { user: data.user };
+  },
 
-  logout: () => request<{ message: string }>("/auth/logout", { method: "POST" }),
+  logout: async () => {
+    const refreshToken = getRefreshToken();
+    try {
+      return await request<{ message: string }>("/auth/logout", { method: "POST", body: JSON.stringify({ refreshToken }) }, false);
+    } finally {
+      clearTokens();
+    }
+  },
 
   me: () => request<{ user: User }>("/auth/me"),
 
@@ -163,4 +237,3 @@ export const api = {
 
   submitDoctorReport: (id: string, body: unknown) => request<{ report: DoctorReport }>(`/scans/${id}/doctor-report`, { method: "POST", body: JSON.stringify(body) })
 };
-
